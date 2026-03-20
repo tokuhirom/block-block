@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import "./style.css";
+import { STAGES, type BlockKind, type StageCell, type StageDefinition } from "./stages";
 
 const VIRTUAL_WIDTH = 390;
 const VIRTUAL_HEIGHT = 844;
@@ -7,29 +8,50 @@ const TOP_HUD_HEIGHT = 92;
 const ARENA_PADDING = 18;
 const BLOCK_COLUMNS = 7;
 const BLOCK_ROWS = 6;
+const BALL_RADIUS = 9;
+const BALL_SPEED = 380;
+const PADDLE_WIDTH = 108;
+const PADDLE_Y_OFFSET = 86;
+
+type GameState = "ready" | "playing" | "won" | "lost";
+type BallState = {
+  shape: Phaser.GameObjects.Arc;
+  velocity: Phaser.Math.Vector2;
+};
+
+type BlockState = {
+  body: Phaser.GameObjects.Rectangle;
+  label?: Phaser.GameObjects.Text;
+  kind: BlockKind;
+  hitsRemaining: number;
+  isClearing: boolean;
+};
 
 class BreakoutScene extends Phaser.Scene {
   private paddle!: Phaser.GameObjects.Rectangle;
-  private ball!: Phaser.GameObjects.Arc;
-  private blocks!: Phaser.GameObjects.Group;
+  private blocks: BlockState[] = [];
+  private balls: BallState[] = [];
   private scoreText!: Phaser.GameObjects.Text;
   private livesText!: Phaser.GameObjects.Text;
+  private legendText!: Phaser.GameObjects.Text;
   private overlayTitle!: Phaser.GameObjects.Text;
   private overlayMessage!: Phaser.GameObjects.Text;
   private overlayHint!: Phaser.GameObjects.Text;
+  private stageText!: Phaser.GameObjects.Text;
   private score = 0;
   private lives = 3;
-  private remainingBlocks = 0;
+  private remainingBreakableBlocks = 0;
+  private stageIndex = 0;
   private pointerX = VIRTUAL_WIDTH / 2;
+  private dragStartX = 0;
+  private dragPaddleStartX = VIRTUAL_WIDTH / 2;
+  private activePointerId: number | null = null;
   private arenaTop = TOP_HUD_HEIGHT;
   private arenaBottom = VIRTUAL_HEIGHT - 40;
   private arenaLeft = ARENA_PADDING;
   private arenaRight = VIRTUAL_WIDTH - ARENA_PADDING;
   private paddleSpeed = 18;
-  private ballVelocity = new Phaser.Math.Vector2(0, 0);
-  private ballSpeed = 380;
-  private ballReleased = false;
-  private gameState: "ready" | "playing" | "won" | "lost" = "ready";
+  private gameState: GameState = "ready";
 
   constructor() {
     super("BreakoutScene");
@@ -42,7 +64,6 @@ class BreakoutScene extends Phaser.Scene {
     this.createBounds();
     this.createBlocks();
     this.createPaddle();
-    this.createBall();
     this.createOverlay();
     this.registerInput();
     this.resetRound();
@@ -61,22 +82,24 @@ class BreakoutScene extends Phaser.Scene {
       Math.min(1, this.paddleSpeed * step),
     );
 
-    if (!this.ballReleased) {
-      this.ball.x = this.paddle.x;
-      this.ball.y = this.paddle.y - 22;
+    if (this.gameState !== "playing") {
+      for (const ball of this.balls) {
+        ball.shape.x = this.paddle.x;
+        ball.shape.y = this.paddle.y - 22;
+      }
       return;
     }
 
-    this.ball.x += this.ballVelocity.x * step;
-    this.ball.y += this.ballVelocity.y * step;
+    for (const ball of [...this.balls]) {
+      ball.shape.x += ball.velocity.x * step;
+      ball.shape.y += ball.velocity.y * step;
 
-    this.handleWallCollisions();
-    this.handlePaddleCollision();
-    this.handleBlockCollision();
-
-    if (this.ball.y > this.arenaBottom + 36) {
-      this.loseLife();
+      this.handleWallCollisions(ball);
+      this.handlePaddleCollision(ball);
+      this.handleBlockCollision(ball);
     }
+
+    this.cleanupLostBalls();
   }
 
   private drawBackdrop(): void {
@@ -114,12 +137,28 @@ class BreakoutScene extends Phaser.Scene {
       color: "#d8f7ff",
     });
 
+    this.stageText = this.add.text(VIRTUAL_WIDTH / 2, 58, "", {
+      fontFamily: "Trebuchet MS, Verdana, sans-serif",
+      fontSize: "18px",
+      color: "#f6fbff",
+    });
+    this.stageText.setOrigin(0.5, 0);
+
     this.livesText = this.add.text(VIRTUAL_WIDTH - 20, 58, "", {
       fontFamily: "Trebuchet MS, Verdana, sans-serif",
       fontSize: "18px",
       color: "#ffd39c",
     });
     this.livesText.setOrigin(1, 0);
+
+    this.legendText = this.add.text(20, VIRTUAL_HEIGHT - 18, "", {
+      fontFamily: "Trebuchet MS, Verdana, sans-serif",
+      fontSize: "12px",
+      color: "#d8f7ff",
+    });
+    this.legendText.setOrigin(0, 1);
+    this.legendText.setAlpha(0.8);
+    this.legendText.setText("画面下をドラッグして操作  orange +ball  yellow hit");
 
     this.refreshHud();
   }
@@ -137,43 +176,109 @@ class BreakoutScene extends Phaser.Scene {
   }
 
   private createBlocks(): void {
-    this.blocks = this.add.group();
+    const stage = this.getCurrentStage();
+    this.clearBlocks();
 
     const blockAreaWidth = this.arenaRight - this.arenaLeft - 8;
     const blockWidth = blockAreaWidth / BLOCK_COLUMNS - 8;
     const blockHeight = 24;
     const startX = this.arenaLeft + blockWidth / 2 + 8;
     const startY = this.arenaTop + 56;
-    const colors = [0xf38a6b, 0xffc15c, 0xf9f871, 0x83e7a1, 0x78d8f8, 0xb6a3ff];
 
-    this.remainingBlocks = 0;
+    this.remainingBreakableBlocks = 0;
 
     for (let row = 0; row < BLOCK_ROWS; row += 1) {
       for (let col = 0; col < BLOCK_COLUMNS; col += 1) {
         const x = startX + col * (blockWidth + 8);
         const y = startY + row * (blockHeight + 10);
-        const block = this.add.rectangle(x, y, blockWidth, blockHeight, colors[row]);
-        block.setStrokeStyle(2, 0xffffff, 0.25);
-        this.blocks.add(block);
-        this.remainingBlocks += 1;
+        const cell = stage.layout[row][col];
+        const kind = typeof cell === "string" ? cell : cell.kind;
+        const block = this.buildBlock(cell, x, y, blockWidth, blockHeight);
+        this.blocks.push(block);
+        if (kind !== "wall") {
+          this.remainingBreakableBlocks += 1;
+        }
       }
     }
+  }
+
+  private buildBlock(
+    cell: StageCell,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ): BlockState {
+    const kind = typeof cell === "string" ? cell : cell.kind;
+    const fillColors: Record<BlockKind, number> = {
+      normal: 0x78d8f8,
+      multi: 0xff9f5c,
+      hard: 0xf3df72,
+      wall: 0x5f7482,
+    };
+    const block = this.add.rectangle(x, y, width, height, fillColors[kind]);
+    block.setStrokeStyle(2, 0xffffff, kind === "wall" ? 0.35 : 0.25);
+
+    const hitsRemaining = kind === "hard" ? (typeof cell === "string" ? 2 : cell.hits) : 1;
+    const state: BlockState = {
+      body: block,
+      kind,
+      hitsRemaining,
+      isClearing: false,
+    };
+
+    if (kind === "multi") {
+      const label = this.add.text(x, y, "+", {
+        fontFamily: "Trebuchet MS, Verdana, sans-serif",
+        fontSize: "18px",
+        fontStyle: "700",
+        color: "#fff6e8",
+      });
+      label.setOrigin(0.5);
+      state.label = label;
+    }
+
+    if (kind === "hard") {
+      state.label = this.add.text(x, y, String(hitsRemaining), {
+        fontFamily: "Trebuchet MS, Verdana, sans-serif",
+        fontSize: "14px",
+        fontStyle: "700",
+        color: "#0d2033",
+      });
+      state.label.setOrigin(0.5);
+    }
+
+    if (kind === "wall") {
+      state.label = this.add.text(x, y, "X", {
+        fontFamily: "Trebuchet MS, Verdana, sans-serif",
+        fontSize: "14px",
+        fontStyle: "700",
+        color: "#f6fbff",
+      });
+      state.label.setOrigin(0.5);
+      block.setAlpha(0.95);
+    }
+
+    return state;
+  }
+
+  private clearBlocks(): void {
+    for (const block of this.blocks) {
+      block.body.destroy();
+      block.label?.destroy();
+    }
+    this.blocks = [];
   }
 
   private createPaddle(): void {
     this.paddle = this.add.rectangle(
       VIRTUAL_WIDTH / 2,
-      this.arenaBottom - 32,
-      108,
+      this.arenaBottom - PADDLE_Y_OFFSET,
+      PADDLE_WIDTH,
       18,
       0xf3f8ff,
     );
     this.paddle.setStrokeStyle(3, 0x1e6f89, 0.45);
-  }
-
-  private createBall(): void {
-    this.ball = this.add.circle(VIRTUAL_WIDTH / 2, this.arenaBottom - 54, 9, 0xfff6e8);
-    this.ball.setStrokeStyle(3, 0xffa85a, 0.65);
   }
 
   private createOverlay(): void {
@@ -206,11 +311,17 @@ class BreakoutScene extends Phaser.Scene {
 
   private registerInput(): void {
     this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
-      this.pointerX = pointer.x;
+      if (this.activePointerId !== pointer.id) {
+        return;
+      }
+      this.pointerX = this.dragPaddleStartX + (pointer.x - this.dragStartX);
     });
 
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
-      this.pointerX = pointer.x;
+      this.activePointerId = pointer.id;
+      this.dragStartX = pointer.x;
+      this.dragPaddleStartX = this.paddle.x;
+      this.pointerX = this.paddle.x;
 
       if (this.gameState === "ready") {
         this.startPlay();
@@ -221,33 +332,73 @@ class BreakoutScene extends Phaser.Scene {
         this.restartGame();
       }
     });
+
+    this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+      if (this.activePointerId === pointer.id) {
+        this.activePointerId = null;
+      }
+    });
   }
 
   private startPlay(): void {
     this.gameState = "playing";
-    this.ballReleased = true;
-    this.ballVelocity.set(
+    const openingVelocity = new Phaser.Math.Vector2(
       Phaser.Math.Between(-150, 150),
-      -this.ballSpeed,
-    ).normalize().scale(this.ballSpeed);
+      -BALL_SPEED,
+    )
+      .normalize()
+      .scale(BALL_SPEED);
+    const firstBall = this.balls[0];
+    if (firstBall) {
+      firstBall.velocity.copy(openingVelocity);
+    }
     this.setOverlay("", "", "");
   }
 
   private resetRound(): void {
-    this.ballReleased = false;
+    this.clearBalls();
+    this.spawnBall(this.paddle.x, this.paddle.y - 22, new Phaser.Math.Vector2(0, 0));
     this.gameState = "ready";
-    this.ballVelocity.set(0, 0);
     this.pointerX = this.paddle.x;
-    this.setOverlay("Tap To Start", "左右にドラッグしてパドルを動かす", "タップでボール発射");
+    this.refreshHud();
+    this.setOverlay("Tap To Start", this.getCurrentStage().hint, "左右にドラッグしてパドルを動かす");
   }
 
   private restartGame(): void {
     this.score = 0;
     this.lives = 3;
+    this.stageIndex = 0;
     this.refreshHud();
-    this.blocks.clear(true, true);
     this.createBlocks();
     this.resetRound();
+  }
+
+  private clearBalls(): void {
+    for (const ball of this.balls) {
+      ball.shape.destroy();
+    }
+    this.balls = [];
+  }
+
+  private spawnBall(x: number, y: number, velocity: Phaser.Math.Vector2): BallState {
+    const ball = this.add.circle(x, y, BALL_RADIUS, 0xfff6e8);
+    ball.setStrokeStyle(3, 0xffa85a, 0.65);
+    const state: BallState = {
+      shape: ball,
+      velocity,
+    };
+    this.balls.push(state);
+    return state;
+  }
+
+  private splitBall(source: BallState): void {
+    const variants = [-28, 28];
+    for (const angleOffset of variants) {
+      const velocity = source.velocity.clone().rotate(Phaser.Math.DegToRad(angleOffset));
+      velocity.normalize().scale(BALL_SPEED);
+      const spawned = this.spawnBall(source.shape.x, source.shape.y, velocity);
+      spawned.shape.setFillStyle(0xffe3be);
+    }
   }
 
   private loseLife(): void {
@@ -259,7 +410,7 @@ class BreakoutScene extends Phaser.Scene {
     this.refreshHud();
 
     if (this.lives <= 0) {
-      this.ballReleased = false;
+      this.clearBalls();
       this.gameState = "lost";
       this.setOverlay("Game Over", "もう一度タップでやり直し", "score " + this.score);
       return;
@@ -268,104 +419,179 @@ class BreakoutScene extends Phaser.Scene {
     this.resetRound();
   }
 
-  private handleWallCollisions(): void {
-    const radius = this.ball.radius;
+  private handleWallCollisions(ball: BallState): void {
+    const radius = ball.shape.radius;
 
-    if (this.ball.x <= this.arenaLeft + radius) {
-      this.ball.x = this.arenaLeft + radius;
-      this.ballVelocity.x = Math.abs(this.ballVelocity.x);
+    if (ball.shape.x <= this.arenaLeft + radius) {
+      ball.shape.x = this.arenaLeft + radius;
+      ball.velocity.x = Math.abs(ball.velocity.x);
     }
 
-    if (this.ball.x >= this.arenaRight - radius) {
-      this.ball.x = this.arenaRight - radius;
-      this.ballVelocity.x = -Math.abs(this.ballVelocity.x);
+    if (ball.shape.x >= this.arenaRight - radius) {
+      ball.shape.x = this.arenaRight - radius;
+      ball.velocity.x = -Math.abs(ball.velocity.x);
     }
 
-    if (this.ball.y <= this.arenaTop + radius) {
-      this.ball.y = this.arenaTop + radius;
-      this.ballVelocity.y = Math.abs(this.ballVelocity.y);
+    if (ball.shape.y <= this.arenaTop + radius) {
+      ball.shape.y = this.arenaTop + radius;
+      ball.velocity.y = Math.abs(ball.velocity.y);
     }
   }
 
-  private handlePaddleCollision(): void {
-    if (this.ballVelocity.y <= 0) {
+  private handlePaddleCollision(ball: BallState): void {
+    if (ball.velocity.y <= 0) {
       return;
     }
 
     const intersects =
-      this.ball.x + this.ball.radius >= this.paddle.x - this.paddle.width / 2 &&
-      this.ball.x - this.ball.radius <= this.paddle.x + this.paddle.width / 2 &&
-      this.ball.y + this.ball.radius >= this.paddle.y - this.paddle.height / 2 &&
-      this.ball.y - this.ball.radius <= this.paddle.y + this.paddle.height / 2;
+      ball.shape.x + ball.shape.radius >= this.paddle.x - this.paddle.width / 2 &&
+      ball.shape.x - ball.shape.radius <= this.paddle.x + this.paddle.width / 2 &&
+      ball.shape.y + ball.shape.radius >= this.paddle.y - this.paddle.height / 2 &&
+      ball.shape.y - ball.shape.radius <= this.paddle.y + this.paddle.height / 2;
 
     if (!intersects) {
       return;
     }
 
-    const impact = (this.ball.x - this.paddle.x) / (this.paddle.width / 2);
-    this.ball.y = this.paddle.y - this.paddle.height / 2 - this.ball.radius - 1;
-    this.ballVelocity.set(
-      impact * this.ballSpeed * 0.95,
-      -Math.abs(this.ballSpeed),
-    ).normalize().scale(this.ballSpeed);
+    const impact = (ball.shape.x - this.paddle.x) / (this.paddle.width / 2);
+    ball.shape.y = this.paddle.y - this.paddle.height / 2 - ball.shape.radius - 1;
+    ball.velocity
+      .set(impact * BALL_SPEED * 0.95, -Math.abs(BALL_SPEED))
+      .normalize()
+      .scale(BALL_SPEED);
   }
 
-  private handleBlockCollision(): void {
-    const children = this.blocks.getChildren() as Phaser.GameObjects.Rectangle[];
+  private handleBlockCollision(ball: BallState): void {
+    for (const block of this.blocks) {
+      if (!block.body.active || block.isClearing) {
+        continue;
+      }
 
-    for (const block of children) {
-      const halfWidth = block.width / 2;
-      const halfHeight = block.height / 2;
+      const halfWidth = block.body.width / 2;
+      const halfHeight = block.body.height / 2;
       const hit =
-        this.ball.x + this.ball.radius >= block.x - halfWidth &&
-        this.ball.x - this.ball.radius <= block.x + halfWidth &&
-        this.ball.y + this.ball.radius >= block.y - halfHeight &&
-        this.ball.y - this.ball.radius <= block.y + halfHeight;
+        ball.shape.x + ball.shape.radius >= block.body.x - halfWidth &&
+        ball.shape.x - ball.shape.radius <= block.body.x + halfWidth &&
+        ball.shape.y + ball.shape.radius >= block.body.y - halfHeight &&
+        ball.shape.y - ball.shape.radius <= block.body.y + halfHeight;
 
       if (!hit) {
         continue;
       }
 
       const overlapX = Math.min(
-        this.ball.x + this.ball.radius - (block.x - halfWidth),
-        block.x + halfWidth - (this.ball.x - this.ball.radius),
+        ball.shape.x + ball.shape.radius - (block.body.x - halfWidth),
+        block.body.x + halfWidth - (ball.shape.x - ball.shape.radius),
       );
       const overlapY = Math.min(
-        this.ball.y + this.ball.radius - (block.y - halfHeight),
-        block.y + halfHeight - (this.ball.y - this.ball.radius),
+        ball.shape.y + ball.shape.radius - (block.body.y - halfHeight),
+        block.body.y + halfHeight - (ball.shape.y - ball.shape.radius),
       );
 
       if (overlapX < overlapY) {
-        this.ballVelocity.x *= -1;
+        ball.velocity.x *= -1;
       } else {
-        this.ballVelocity.y *= -1;
+        ball.velocity.y *= -1;
       }
 
-      this.tweens.add({
-        targets: block,
-        scaleX: 0.85,
-        scaleY: 0.85,
-        alpha: 0,
-        duration: 120,
-        onComplete: () => block.destroy(),
-      });
-
-      this.remainingBlocks -= 1;
-      this.score += 100;
-      this.refreshHud();
-
-      if (this.remainingBlocks <= 0) {
-        this.ballReleased = false;
-        this.gameState = "won";
-        this.setOverlay("Stage Clear", "全ブロック破壊", "タップでリスタート");
-      }
+      this.onBlockHit(block, ball);
       return;
+    }
+  }
+
+  private onBlockHit(block: BlockState, ball: BallState): void {
+    if (block.kind === "wall") {
+      this.tweens.add({
+        targets: [block.body, block.label].filter(Boolean),
+        alpha: 0.7,
+        duration: 80,
+        yoyo: true,
+      });
+      return;
+    }
+
+    if (block.kind === "multi") {
+      this.splitBall(ball);
+    }
+
+    block.hitsRemaining -= 1;
+
+    if (block.kind === "hard" && block.hitsRemaining > 0) {
+      block.label?.setText(String(block.hitsRemaining));
+      block.body.setFillStyle(block.hitsRemaining === 2 ? 0xf3df72 : 0xffc15c);
+      this.score += 40;
+      this.refreshHud();
+      this.tweens.add({
+        targets: [block.body, block.label].filter(Boolean),
+        scaleX: 0.94,
+        scaleY: 0.94,
+        duration: 70,
+        yoyo: true,
+      });
+      return;
+    }
+
+    block.isClearing = true;
+    block.body.disableInteractive();
+    block.body.active = false;
+    block.label?.setVisible(false);
+
+    this.tweens.add({
+      targets: [block.body, block.label].filter(Boolean),
+      scaleX: 0.85,
+      scaleY: 0.85,
+      alpha: 0,
+      duration: 120,
+      onComplete: () => {
+        block.body.destroy();
+        block.label?.destroy();
+      },
+    });
+
+    this.remainingBreakableBlocks -= 1;
+    this.score += block.kind === "multi" ? 150 : 100;
+    this.refreshHud();
+
+    if (this.remainingBreakableBlocks <= 0) {
+      this.clearBalls();
+      if (this.stageIndex >= STAGES.length - 1) {
+        this.gameState = "won";
+        this.setOverlay("All Clear", "全ステージ制圧", "タップで最初から");
+        return;
+      }
+
+      this.stageIndex += 1;
+      this.createBlocks();
+      this.gameState = "ready";
+      this.pointerX = this.paddle.x;
+      this.spawnBall(this.paddle.x, this.paddle.y - 22, new Phaser.Math.Vector2(0, 0));
+      this.refreshHud();
+      this.setOverlay("Stage Clear", this.getCurrentStage().hint, "タップで次のステージへ");
+    }
+  }
+
+  private cleanupLostBalls(): void {
+    const survivors = this.balls.filter((ball) => ball.shape.y <= this.arenaBottom + 36);
+    for (const ball of this.balls) {
+      if (!survivors.includes(ball)) {
+        ball.shape.destroy();
+      }
+    }
+    this.balls = survivors;
+
+    if (this.balls.length === 0) {
+      this.loseLife();
     }
   }
 
   private refreshHud(): void {
     this.scoreText.setText("score " + this.score);
-    this.livesText.setText("life " + this.lives);
+    this.stageText.setText(this.getCurrentStage().name);
+    this.livesText.setText("life " + this.lives + "  ball " + this.balls.length);
+  }
+
+  private getCurrentStage(): StageDefinition {
+    return STAGES[this.stageIndex];
   }
 
   private setOverlay(title: string, message: string, hint: string): void {
