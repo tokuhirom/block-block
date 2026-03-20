@@ -13,10 +13,11 @@ const BALL_SPEED = 380;
 const PADDLE_WIDTH = 108;
 const PADDLE_Y_OFFSET = 86;
 
-type GameState = "ready" | "playing" | "won" | "lost";
+type GameState = "ready" | "playing" | "transition" | "won" | "lost";
 type BallState = {
   shape: Phaser.GameObjects.Arc;
   velocity: Phaser.Math.Vector2;
+  stallTime: number;
 };
 
 type BlockState = {
@@ -84,13 +85,16 @@ class BreakoutScene extends Phaser.Scene {
 
     if (this.gameState !== "playing") {
       for (const ball of this.balls) {
-        ball.shape.x = this.paddle.x;
-        ball.shape.y = this.paddle.y - 22;
+        if (this.gameState === "ready") {
+          ball.shape.x = this.paddle.x;
+          ball.shape.y = this.paddle.y - 22;
+        }
       }
       return;
     }
 
     for (const ball of [...this.balls]) {
+      this.updateBallStall(ball, step);
       ball.shape.x += ball.velocity.x * step;
       ball.shape.y += ball.velocity.y * step;
 
@@ -386,6 +390,7 @@ class BreakoutScene extends Phaser.Scene {
     const state: BallState = {
       shape: ball,
       velocity,
+      stallTime: 0,
     };
     this.balls.push(state);
     return state;
@@ -425,16 +430,19 @@ class BreakoutScene extends Phaser.Scene {
     if (ball.shape.x <= this.arenaLeft + radius) {
       ball.shape.x = this.arenaLeft + radius;
       ball.velocity.x = Math.abs(ball.velocity.x);
+      ball.stallTime = 0;
     }
 
     if (ball.shape.x >= this.arenaRight - radius) {
       ball.shape.x = this.arenaRight - radius;
       ball.velocity.x = -Math.abs(ball.velocity.x);
+      ball.stallTime = 0;
     }
 
     if (ball.shape.y <= this.arenaTop + radius) {
       ball.shape.y = this.arenaTop + radius;
       ball.velocity.y = Math.abs(ball.velocity.y);
+      ball.stallTime = 0;
     }
   }
 
@@ -459,6 +467,7 @@ class BreakoutScene extends Phaser.Scene {
       .set(impact * BALL_SPEED * 0.95, -Math.abs(BALL_SPEED))
       .normalize()
       .scale(BALL_SPEED);
+    ball.stallTime = 0;
   }
 
   private handleBlockCollision(ball: BallState): void {
@@ -494,9 +503,29 @@ class BreakoutScene extends Phaser.Scene {
         ball.velocity.y *= -1;
       }
 
+      ball.stallTime = 0;
       this.onBlockHit(block, ball);
       return;
     }
+  }
+
+  private updateBallStall(ball: BallState, step: number): void {
+    if (Math.abs(ball.velocity.y) >= 110) {
+      ball.stallTime = 0;
+      return;
+    }
+
+    ball.stallTime += step;
+    if (ball.stallTime < 1.2) {
+      return;
+    }
+
+    const forcedVertical = ball.velocity.y >= 0 ? 180 : -180;
+    ball.velocity
+      .set(ball.velocity.x, forcedVertical)
+      .normalize()
+      .scale(BALL_SPEED);
+    ball.stallTime = 0;
   }
 
   private onBlockHit(block: BlockState, ball: BallState): void {
@@ -553,20 +582,7 @@ class BreakoutScene extends Phaser.Scene {
     this.refreshHud();
 
     if (this.remainingBreakableBlocks <= 0) {
-      this.clearBalls();
-      if (this.stageIndex >= STAGES.length - 1) {
-        this.gameState = "won";
-        this.setOverlay("All Clear", "全ステージ制圧", "タップで最初から");
-        return;
-      }
-
-      this.stageIndex += 1;
-      this.createBlocks();
-      this.gameState = "ready";
-      this.pointerX = this.paddle.x;
-      this.spawnBall(this.paddle.x, this.paddle.y - 22, new Phaser.Math.Vector2(0, 0));
-      this.refreshHud();
-      this.setOverlay("Stage Clear", this.getCurrentStage().hint, "タップで次のステージへ");
+      this.beginStageTransition();
     }
   }
 
@@ -592,6 +608,25 @@ class BreakoutScene extends Phaser.Scene {
 
   private getCurrentStage(): StageDefinition {
     return STAGES[this.stageIndex];
+  }
+
+  private beginStageTransition(): void {
+    this.clearBalls();
+
+    if (this.stageIndex >= STAGES.length - 1) {
+      this.gameState = "won";
+      this.setOverlay("All Clear", "全ステージ制圧", "タップで最初から");
+      return;
+    }
+
+    this.gameState = "transition";
+    this.setOverlay("Stage Clear", this.getCurrentStage().name + " clear", "次のステージを準備中");
+
+    this.time.delayedCall(220, () => {
+      this.stageIndex += 1;
+      this.createBlocks();
+      this.resetRound();
+    });
   }
 
   private setOverlay(title: string, message: string, hint: string): void {
